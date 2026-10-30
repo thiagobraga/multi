@@ -39,6 +39,14 @@ multi -c               # close everything multi opened
 multi instagram -w     # close only instagram windows
 ```
 
+## Tests
+
+```sh
+python3 -m unittest discover -s tests
+```
+
+Chrome, xdotool and the screen are mocked, so tests run anywhere with Python 3.
+
 ## How it works
 
 - Profiles live in `~/.local/share/multi/<site>/<n>`. Delete a folder to forget that account.
