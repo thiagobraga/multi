@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Open N isolated Chrome windows of the same site, tiled on screen.
+
+  multi instagram            2 columns, https://instagram.com
+  multi oracle -x3           3 columns
+  multi aws.amazon.com -x6   cascade (>= 5)
+  multi instagram --bitwarden   extra Bitwarden vault window on the right (default profile)
+  multi instagram -d         first window uses your default Chrome profile
+  multi -c | -w | --close    close everything multi opened (add a target to close only that site)
+"""
+import argparse
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+VERSION = "0.1.0"
+CHROME = "google-chrome"
+DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "multi"
+BITWARDEN_URL = "https://vault.bitwarden.com"
+BW_WIDTH, BW_HEIGHT = 420, 720
+CASCADE_STEP = 40
+
+
+def resolve(target):
+    if "://" in target:
+        return target
+    host = target if "." in target else f"{target}.com"
+    return f"https://{host}"
+
+
+def workarea():
+    """x, y, w, h of the primary monitor, minus the GNOME top bar."""
+    out = subprocess.run(["xrandr", "--listmonitors"], capture_output=True, text=True, check=True).stdout
+    mons = [m for m in re.finditer(r"^\s*\d+: \+(\*?)\S+ (\d+)/\d+x(\d+)/\d+\+(\d+)\+(\d+)", out, re.M)]
+    m = next((m for m in mons if m.group(1)), mons[0])
+    w, h, x, y = map(int, m.groups()[1:])
+    if y == 0:
+        bar = int(re.findall(r"\d+", subprocess.run(["xprop", "-root", "_NET_WORKAREA"], capture_output=True, text=True).stdout)[1])
+        y, h = bar, h - bar
+    return x, y, w, h
+
+
+def layout(n, area):
+    x0, y0, w, h = area
+    if n <= 4:
+        cw = w // n
+        return [(x0 + i * cw, y0, cw, h) for i in range(n)]
+    cw, ch = int(w * 0.6), int(h * 0.8)
+    return [(x0 + i * CASCADE_STEP, y0 + i * CASCADE_STEP, cw, ch) for i in range(n)]
+
+
+def launch(profile, url, geom, app=False):
+    """profile=None uses Chrome's own default profile (extensions, logins) instead of an isolated one."""
+    x, y, w, h = geom
+    cmd = [CHROME, "--ozone-platform=x11", "--force-device-scale-factor=1"]
+    if profile is not None:
+        profile.mkdir(parents=True, exist_ok=True)
+        cmd.append(f"--user-data-dir={profile}")
+    cmd += [
+        f"--window-position={x},{y}",
+        f"--window-size={w},{h}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        f"--app={url}" if app else url,
+    ]
+    return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def chrome_windows():
+    return set(subprocess.run(["xdotool", "search", "--onlyvisible", "--class", "google-chrome"], capture_output=True, text=True).stdout.split())
+
+
+def place(proc, geom, known=None, timeout=15):
+    """Snap a window once mapped (xdotool; wmctrl is ignored by mutter).
+
+    Isolated profiles are found by pid. The default profile hands off to an already running Chrome,
+    so its pid is useless: pass `known` (window ids before launch) and take the new one instead.
+    """
+    x, y, w, h = geom
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if known is None:
+            out = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(proc.pid)], capture_output=True, text=True).stdout.split()
+        else:
+            out = list(chrome_windows() - known)
+        if out:
+            time.sleep(0.4)
+            for wid in out:
+                subprocess.run(["xdotool", "windowmove", wid, str(x), str(y), "windowsize", wid, str(w), str(h)])
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def site_key(url):
+    return re.sub(r"[^a-z0-9]+", "-", re.sub(r"^\w+://", "", url).lower()).strip("-")
+
+
+def close(key=None):
+    """SIGTERM the main Chrome process of every instance we started (optionally one site only)."""
+    pattern = re.compile(rf"--user-data-dir={re.escape(str(DATA))}/(\S+)")
+    n = 0
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            # Chrome rewrites its process title, so args may be space-joined in one argv entry
+            cmd = Path(f"/proc/{pid}/cmdline").read_bytes().decode().replace("\0", " ")
+        except OSError:
+            continue
+        m = pattern.search(cmd)
+        if not m or "--type=" in cmd or (key and m.group(1).split("/")[0] != key):
+            continue
+        os.kill(int(pid), signal.SIGTERM)
+        n += 1
+    print(f"multi: closed {n} instance(s)")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="multi", description="Tile N isolated Chrome windows of one site.")
+    p.add_argument("-v", "--version", action="version", version=f"multi {VERSION}")
+    p.add_argument("target", nargs="?", help="name (instagram), domain (aws.amazon.com) or full URL")
+    p.add_argument("-x", type=int, default=2, metavar="N", help="window count (default 2)")
+    p.add_argument("--bitwarden", action="store_true", help="also open a small Bitwarden vault window (uses your default Chrome profile)")
+    p.add_argument("-d", "--default", action="store_true", help="first window uses your default Chrome profile")
+    p.add_argument("-c", "-w", "--close", action="store_true", help="close windows opened by multi (all, or only TARGET's)")
+    args = p.parse_args()
+    if args.close:
+        return close(site_key(resolve(args.target)) if args.target else None)
+    if not args.target:
+        p.error("target is required")
+    if args.x < 1:
+        sys.exit("multi: -x must be >= 1")
+
+    url = resolve(args.target)
+    key = site_key(url)
+
+    x0, y0, w, h = workarea()
+    if args.bitwarden:
+        w -= BW_WIDTH
+    slots = layout(args.x, (x0, y0, w, h))
+
+    # default-profile windows first and one at a time: they join the running Chrome, so we find them by diffing window ids
+    defaults = []
+    if args.default:
+        defaults.append((url, slots[0], False))
+    if args.bitwarden:
+        defaults.append((BITWARDEN_URL, (x0 + w, y0, BW_WIDTH, min(BW_HEIGHT, h)), True))
+    for u, g, app in defaults:
+        known = chrome_windows()
+        if not place(launch(None, u, g, app=app), g, known=known, timeout=8):
+            print(f"multi: could not position {u} (your main Chrome runs on Wayland; quit it and start it with --ozone-platform=x11)", file=sys.stderr)
+
+    jobs = [(launch(DATA / key / str(i), url, g), g) for i, g in enumerate(slots, start=1) if not (args.default and i == 1)]
+    for proc, g in jobs:
+        place(proc, g)
+
+
+if __name__ == "__main__":
+    main()
